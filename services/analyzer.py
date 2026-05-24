@@ -5,7 +5,7 @@ from config import GEMINI_API_KEY
 
 _client = genai.Client(api_key=GEMINI_API_KEY)
 
-MODEL = "gemini-3.5-flash"
+MODEL = "gemini-3-flash-preview"
 MAX_RETRIES = 5
 RETRY_DELAY = 3
 
