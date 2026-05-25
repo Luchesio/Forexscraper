@@ -1,9 +1,12 @@
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+import asyncio
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from services.scraper import scrape_all_sources
-from services.analyzer import run_full_analysis
+from services.analyzer import run_full_analysis, get_cache_status, invalidate_cache
 
 router = APIRouter()
+
+_analysis_lock = asyncio.Lock()
 
 
 class AnalysisResponse(BaseModel):
@@ -15,80 +18,61 @@ class AnalysisResponse(BaseModel):
     trade_environment: str
     htf_alignment: str
     sources_scraped: list[str]
+    from_cache: bool = False
 
 
-class PartialAnalysisResponse(BaseModel):
-    result: str
-    section: str
+class CacheStatusResponse(BaseModel):
+    entries: int
+    valid_entries: int
+    ttl_seconds: int
+    ages_seconds: dict[str, int]
 
 
-@router.post("/analyse", response_model=AnalysisResponse, summary="Run full market analysis")
+@router.post("/analyse", response_model=AnalysisResponse, summary="Run full market analysis (1 Gemini call)")
 async def run_analysis():
-    scraped = await scrape_all_sources()
-
-    if not any(scraped.values()):
+    if _analysis_lock.locked():
         raise HTTPException(
-            status_code=503,
-            detail="All scrapers returned empty. Check your SERPER_API_KEY and source URLs."
+            status_code=429,
+            detail="Analysis already in progress. Please wait for the current run to finish."
         )
 
-    try:
-        results = run_full_analysis(scraped)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Gemini analysis failed: {str(e)}")
+    async with _analysis_lock:
+        scraped = await scrape_all_sources()
 
-    return AnalysisResponse(
-        macro_narrative=results["macro_narrative"],
-        news_impact=results["news_impact"],
-        bias_summary=results["bias_summary"],
-        fundamental_confidence=results["fundamental_confidence"],
-        session_flow=results["session_flow"],
-        trade_environment=results["trade_environment"],
-        htf_alignment=results["htf_alignment"],
-        sources_scraped=[k for k, v in scraped.items() if v],
-    )
+        if not any(scraped.values()):
+            raise HTTPException(
+                status_code=503,
+                detail="All scrapers returned empty. Check your SERPER_API_KEY and source URLs."
+            )
 
+        cached_before = get_cache_status()["valid_entries"]
 
-@router.post("/analyse/macro", response_model=PartialAnalysisResponse, summary="Macro narrative only")
-async def run_macro_only():
-    from services.analyzer import _build_context, _call_gemini, PROMPT_1_MACRO
+        try:
+            results = run_full_analysis(scraped)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Gemini analysis failed: {str(e)}")
 
-    scraped = await scrape_all_sources()
-    ctx = _build_context(scraped)
+        from_cache = get_cache_status()["valid_entries"] == cached_before
 
-    try:
-        result = _call_gemini(PROMPT_1_MACRO.format(**ctx))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    return PartialAnalysisResponse(result=result, section="macro_narrative")
-
-
-@router.post("/analyse/news", response_model=PartialAnalysisResponse, summary="News impact only")
-async def run_news_only():
-    from services.analyzer import _build_context, _call_gemini, PROMPT_2_NEWS_IMPACT
-
-    scraped = await scrape_all_sources()
-    ctx = _build_context(scraped)
-
-    try:
-        result = _call_gemini(PROMPT_2_NEWS_IMPACT.format(**ctx))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    return PartialAnalysisResponse(result=result, section="news_impact")
+        return AnalysisResponse(
+            macro_narrative=        results["macro_narrative"],
+            news_impact=            results["news_impact"],
+            bias_summary=           results["bias_summary"],
+            fundamental_confidence= results["fundamental_confidence"],
+            session_flow=           results["session_flow"],
+            trade_environment=      results["trade_environment"],
+            htf_alignment=          results["htf_alignment"],
+            sources_scraped=        [k for k, v in scraped.items() if v],
+            from_cache=             from_cache,
+        )
 
 
-@router.post("/analyse/bias", response_model=PartialAnalysisResponse, summary="Bias summary only")
-async def run_bias_only():
-    from services.analyzer import _build_context, _call_gemini, PROMPT_3_BIAS_SUMMARY
+@router.get("/analyse/cache", response_model=CacheStatusResponse, summary="Check cache status")
+async def cache_status():
+    return get_cache_status()
 
-    scraped = await scrape_all_sources()
-    ctx = _build_context(scraped)
 
-    try:
-        result = _call_gemini(PROMPT_3_BIAS_SUMMARY.format(**ctx))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    return PartialAnalysisResponse(result=result, section="bias_summary")
+@router.delete("/analyse/cache", summary="Invalidate analysis cache (force fresh Gemini call on next run)")
+async def clear_cache():
+    invalidate_cache()
+    return {"detail": "Cache cleared. Next analysis will call Gemini."}
