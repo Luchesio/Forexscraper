@@ -3,14 +3,17 @@ import json
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from services.scraper import scrape_all_sources
+from services.scraper import scrape_all_sources, SCRAPER_TIMEOUT_SECONDS
 from services.analyzer import stream_analysis, run_full_analysis, get_cache_status, invalidate_cache
 
 router = APIRouter()
 
 _analysis_lock = asyncio.Lock()
 
-SCRAPER_TIMEOUT = 45.0
+# Route-level safety net: SCRAPER_TIMEOUT_SECONDS (30 s) covers each source,
+# plus a 5 s buffer for gather overhead. This should never fire in practice
+# because per-source timeouts in scraper.py handle everything first.
+ROUTE_SCRAPER_TIMEOUT = SCRAPER_TIMEOUT_SECONDS + 5
 
 
 class AnalysisResponse(BaseModel):
@@ -34,18 +37,27 @@ class CacheStatusResponse(BaseModel):
 
 async def _scrape_with_timeout() -> dict[str, str]:
     try:
-        return await asyncio.wait_for(scrape_all_sources(), timeout=SCRAPER_TIMEOUT)
+        return await asyncio.wait_for(
+            scrape_all_sources(),
+            timeout=ROUTE_SCRAPER_TIMEOUT,
+        )
     except asyncio.TimeoutError:
-        print(f"[Scraper] Timed out after {SCRAPER_TIMEOUT}s — proceeding with partial data")
+        print(
+            f"[Route] Scraper exceeded route safety-net ({ROUTE_SCRAPER_TIMEOUT}s). "
+            "Per-source timeouts should have prevented this — check scraper logs."
+        )
         return {}
 
 
-@router.post("/analyse/stream", summary="Stream analysis sections as they are generated (fast progressive UI)")
+@router.post(
+    "/analyse/stream",
+    summary="Stream analysis sections as they are generated (fast progressive UI)",
+)
 async def stream_analysis_endpoint():
     if _analysis_lock.locked():
         raise HTTPException(
             status_code=429,
-            detail="Analysis already in progress. Please wait for the current run to finish."
+            detail="Analysis already in progress. Please wait for the current run to finish.",
         )
 
     async def event_generator():
@@ -69,19 +81,23 @@ async def stream_analysis_endpoint():
         event_generator(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control":    "no-cache",
+            "Cache-Control":     "no-cache",
             "X-Accel-Buffering": "no",
-            "Connection":       "keep-alive",
+            "Connection":        "keep-alive",
         },
     )
 
 
-@router.post("/analyse", response_model=AnalysisResponse, summary="Blocking full analysis (kept for compatibility)")
+@router.post(
+    "/analyse",
+    response_model=AnalysisResponse,
+    summary="Blocking full analysis (kept for compatibility)",
+)
 async def run_analysis():
     if _analysis_lock.locked():
         raise HTTPException(
             status_code=429,
-            detail="Analysis already in progress. Please wait for the current run to finish."
+            detail="Analysis already in progress. Please wait for the current run to finish.",
         )
 
     async with _analysis_lock:
@@ -112,7 +128,11 @@ async def run_analysis():
         )
 
 
-@router.get("/analyse/cache", response_model=CacheStatusResponse, summary="Check cache status")
+@router.get(
+    "/analyse/cache",
+    response_model=CacheStatusResponse,
+    summary="Check cache status",
+)
 async def cache_status():
     return get_cache_status()
 

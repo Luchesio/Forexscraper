@@ -53,9 +53,13 @@ NewYork: <one concise sentence>
 SECTION: TRADE_ENVIRONMENT
 {DELIM}
 Evaluate the current trade environment on three dimensions derived from the scraped news.
-MARKET STRUCTURE — CLEAN means clear directional movement and structure respected. CHOPPY means contradictory signals or erratic direction.
-REACTION QUALITY — STRONG means strong rejection from HTF POIs (Order Blocks, Breaker Blocks, swing high/low liquidity sweeps), aggressive displacement, clear directional intent, sustained institutional movement. MODERATE means some reaction but not convincing. WEAK means hesitant reactions, shallow displacement, price moving through key zones without meaningful reaction.
-CONFIRMATION RELIABILITY — HIGH means LTF MSS confirmations sustain direction cleanly with strong momentum and reduced fakeouts. MODERATE means some reliability with occasional inconsistencies. LOW means frequent reversals after confirmation, fake breakouts common, weak continuation.
+
+MARKET STRUCTURE — Purpose: Is price moving clearly or behaving randomly? This affects readability, POI respect, and continuation clarity. CLEAN means clear directional movement with structure respected; price is trending with identifiable highs and lows and the market shows purposeful directional intent. CHOPPY means contradictory signals, erratic price action, or random movement without respect for structure — price is moving without clear direction.
+
+REACTION QUALITY — Measures how strongly price reacts from higher timeframe Points of Interest (HTF POIs), including higher timeframe Order Blocks (OB), higher timeframe Breaker Blocks (BB), HTF swing high liquidity sweeps, and HTF swing low liquidity sweeps. Evaluates whether these higher timeframe zones are currently producing strong, clean, and directional reactions that can be used for profitable lower timeframe confirmation entries. STRONG means strong rejection from HTF POIs with aggressive displacement after reacting from key levels, clear directional intent after liquidity sweeps, sustained movement away from HTF zones, and strong institutional reaction behaviour. MODERATE means some reaction from HTF POIs but not fully convincing — partial displacement with inconsistent follow-through. WEAK means hesitant or weak reactions from HTF POIs, shallow displacement after touching key levels, inconsistent directional movement, poor follow-through after liquidity sweeps, and price easily moving through HTF zones without meaningful reaction.
+
+CONFIRMATION RELIABILITY — Measures how dependable lower timeframe market structure shift (LTF MSS) confirmation entries are after price reacts from higher timeframe points of interest (HTF POIs including Order Blocks, Breaker Blocks, and swing high/low liquidity sweeps). Evaluates whether current market conditions favour confirmation-based execution using HTF POI reactions and LTF MSS entries. HIGH means LTF MSS confirmations sustain direction cleanly with strong momentum, reduced fakeouts after MSS confirmation, cleaner alignment between HTF POI reactions and LTF execution, and high continuation probability after confirmation. MODERATE means some reliability with occasional inconsistencies in follow-through — confirmation entries work but with some reversals. LOW means MSS confirmations frequently fail, fake breakouts are common after confirmation, entries reverse shortly after triggering, weak continuation after MSS confirmation, and inconsistent alignment between HTF reactions and LTF confirmations.
+
 Respond in this exact format, nothing else:
 MarketStructure: CLEAN or CHOPPY
 ReactionQuality: STRONG or MODERATE or WEAK
@@ -64,16 +68,22 @@ ConfirmationReliability: HIGH or MODERATE or LOW
 {DELIM}
 SECTION: FUNDAMENTAL_CONFIDENCE
 {DELIM}
-Score the FUNDAMENTAL CONFIDENCE for each currency (0.0-10.0) based on: directional clarity from the news, central bank stance clarity, rate differential strength, news-driven momentum.
+Score the FUNDAMENTAL CONFIDENCE for each currency (0.0-10.0) based on: directional clarity from the news, central bank stance clarity, rate differential strength, news-driven momentum. This score provides a quick conviction level, indicates whether fundamentals are aligned or mixed, and gives context for how aggressively to trade.
+
+Scoring ranges:
+- 8-10 = STRONG alignment (strong macro conviction; fundamentals clearly support one direction — trade aggressively in the bias direction)
+- 6-7 = MODERATE tradable (fundamentals lean one way but some mixed signals present — trade with normal sizing)
+- 5 or below = MIXED conditions (fundamentals unclear or conflicting — avoid or size down significantly)
+
 Respond in this exact format, one currency per line, nothing else:
-USD: score=X.X interpretation=<one concise sentence>
-EUR: score=X.X interpretation=<one concise sentence>
-GBP: score=X.X interpretation=<one concise sentence>
-JPY: score=X.X interpretation=<one concise sentence>
-AUD: score=X.X interpretation=<one concise sentence>
-NZD: score=X.X interpretation=<one concise sentence>
-CAD: score=X.X interpretation=<one concise sentence>
-CHF: score=X.X interpretation=<one concise sentence>
+USD: score=X.X alignment=STRONG interpretation=<one concise sentence>
+EUR: score=X.X alignment=MODERATE interpretation=<one concise sentence>
+GBP: score=X.X alignment=MIXED interpretation=<one concise sentence>
+JPY: score=X.X alignment=<STRONG|MODERATE|MIXED> interpretation=<one concise sentence>
+AUD: score=X.X alignment=<STRONG|MODERATE|MIXED> interpretation=<one concise sentence>
+NZD: score=X.X alignment=<STRONG|MODERATE|MIXED> interpretation=<one concise sentence>
+CAD: score=X.X alignment=<STRONG|MODERATE|MIXED> interpretation=<one concise sentence>
+CHF: score=X.X alignment=<STRONG|MODERATE|MIXED> interpretation=<one concise sentence>
 
 {DELIM}
 SECTION: HTF_ALIGNMENT
