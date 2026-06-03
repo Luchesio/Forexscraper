@@ -1,28 +1,59 @@
 import asyncio
-import hashlib
+import json
 import re
 import time
 from datetime import datetime, timezone
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Any, Callable, Optional
+
 from google import genai
+
 from config import GEMINI_API_KEY
+from services.schemas import (
+    SessionFlow,
+    MarketContext,
+    CurrencyScore,
+    HtfAlignmentItem,
+    InstrumentBias,
+    EconomicEvent,
+)
 
 _client = genai.Client(api_key=GEMINI_API_KEY)
 
 MODEL             = "gemini-3.5-flash"
 MAX_RETRIES       = 4
 BASE_DELAY        = 5
-CACHE_TTL_SECONDS = 600
-
-_cache: dict = {}
 
 SECTION_DELIMITER = "═" * 40
 
+# Currency / instrument universes — kept here so the prompt always asks for the
+# exact set the frontend renders. (Single source of truth on the backend.)
+CURRENCIES = ["USD", "EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF"]
+
+INSTRUMENTS = [
+    "GBPJPY", "EURJPY", "USDJPY", "GBPUSD", "EURUSD", "AUDUSD", "NZDUSD", "USDCAD",
+    "USDCHF", "EURGBP", "EURAUD", "EURNZD", "EURCAD", "EURCHF", "GBPAUD", "GBPNZD",
+    "GBPCAD", "GBPCHF", "AUDJPY", "AUDNZD", "AUDCAD", "AUDCHF", "NZDJPY", "NZDCAD",
+    "NZDCHF", "CADJPY", "CADCHF", "CHFJPY", "BTCUSD", "ETHUSD", "ETHBTC", "XAUUSD",
+    "XAGUSD", "USOIL", "UKOIL", "NAS100", "SPX500", "US30", "GER40", "UK100", "JP225",
+]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Prompt
+#
+# Five sections now return STRICT JSON (machine-readable). Two stay prose.
+# Examples are deliberately VARIED (bullish AND bearish, strong AND weak) so the
+# model is not anchored toward a single direction — this is what makes the output
+# trustworthy instead of biased.
+# ─────────────────────────────────────────────────────────────────────────────
 MEGA_PROMPT = """You are a professional forex and financial market analyst.
 
 TODAY'S DATE: {today}
 
-RECENCY RULE: Only use news posted within the last 10 minutes. If a piece of news has no timestamp, include it. Skip any news explicitly timestamped older than 10 minutes. ALL output must be derived strictly from the scraped content below. Never guess.
+RULES:
+- ALL output must be derived strictly from the scraped content below. Never invent data.
+- Prefer the most recent news. If an item has no timestamp, you may still use it.
+- For every JSON section: output ONLY valid JSON between the delimiters — no markdown code fences, no commentary, no trailing text. Use the EXACT keys shown.
 
 --- TradingEconomics ---
 {trading_economics}
@@ -38,111 +69,97 @@ RECENCY RULE: Only use news posted within the last 10 minutes. If a piece of new
 
 ---
 
-Produce ALL seven sections below in a single response. Use EXACTLY the section delimiters shown — do not omit or rename any section. Output them in the order listed.
+Produce ALL seven sections below in order. Use EXACTLY the section delimiters shown — do not omit or rename any section.
 
 {DELIM}
 SECTION: SESSION_FLOW
 {DELIM}
-Describe market flow for each session based only on the scraped news.
-Respond in this exact format, nothing else:
-Asia: <one concise sentence>
-London: <one concise sentence>
-NewYork: <one concise sentence>
+Output a single JSON object describing market flow per session, derived only from the scraped news:
+{{"asia": "<one concise sentence>", "london": "<one concise sentence>", "newYork": "<one concise sentence>"}}
 
 {DELIM}
 SECTION: TRADE_ENVIRONMENT
 {DELIM}
-Evaluate the current trade environment on three dimensions derived from the scraped news.
+Evaluate the current GLOBAL trade environment and risk sentiment from the scraped news.
 
-MARKET STRUCTURE — Purpose: Is price moving clearly or behaving randomly? This affects readability, POI respect, and continuation clarity. CLEAN means clear directional movement with structure respected; price is trending with identifiable highs and lows and the market shows purposeful directional intent. CHOPPY means contradictory signals, erratic price action, or random movement without respect for structure — price is moving without clear direction.
+marketStructure — CLEAN = clear directional movement, structure respected, purposeful intent. CHOPPY = contradictory/erratic price action with no clear direction.
+reactionQuality — STRONG = aggressive displacement and clean rejections from HTF POIs (order blocks, breaker blocks, liquidity sweeps). MODERATE = partial/inconsistent reactions. WEAK = shallow reactions, price slicing through zones.
+confirmationReliability — HIGH = LTF MSS confirmations follow through cleanly, few fakeouts. MODERATE = work with occasional reversals. LOW = frequent failed confirmations and fakeouts.
+riskMode — ON = risk appetite / flows into risk assets. OFF = risk aversion / safe-haven demand. NEUTRAL = mixed.
 
-REACTION QUALITY — Measures how strongly price reacts from higher timeframe Points of Interest (HTF POIs), including higher timeframe Order Blocks (OB), higher timeframe Breaker Blocks (BB), HTF swing high liquidity sweeps, and HTF swing low liquidity sweeps. Evaluates whether these higher timeframe zones are currently producing strong, clean, and directional reactions that can be used for profitable lower timeframe confirmation entries. STRONG means strong rejection from HTF POIs with aggressive displacement after reacting from key levels, clear directional intent after liquidity sweeps, sustained movement away from HTF zones, and strong institutional reaction behaviour. MODERATE means some reaction from HTF POIs but not fully convincing — partial displacement with inconsistent follow-through. WEAK means hesitant or weak reactions from HTF POIs, shallow displacement after touching key levels, inconsistent directional movement, poor follow-through after liquidity sweeps, and price easily moving through HTF zones without meaningful reaction.
-
-CONFIRMATION RELIABILITY — Measures how dependable lower timeframe market structure shift (LTF MSS) confirmation entries are after price reacts from higher timeframe points of interest (HTF POIs including Order Blocks, Breaker Blocks, and swing high/low liquidity sweeps). Evaluates whether current market conditions favour confirmation-based execution using HTF POI reactions and LTF MSS entries. HIGH means LTF MSS confirmations sustain direction cleanly with strong momentum, reduced fakeouts after MSS confirmation, cleaner alignment between HTF POI reactions and LTF execution, and high continuation probability after confirmation. MODERATE means some reliability with occasional inconsistencies in follow-through — confirmation entries work but with some reversals. LOW means MSS confirmations frequently fail, fake breakouts are common after confirmation, entries reverse shortly after triggering, weak continuation after MSS confirmation, and inconsistent alignment between HTF reactions and LTF confirmations.
-
-Respond in this exact format, nothing else:
-MarketStructure: CLEAN or CHOPPY
-ReactionQuality: STRONG or MODERATE or WEAK
-ConfirmationReliability: HIGH or MODERATE or LOW
+Output a single JSON object:
+{{"marketStructure": "CLEAN|CHOPPY", "reactionQuality": "STRONG|MODERATE|WEAK", "confirmationReliability": "HIGH|MODERATE|LOW", "riskMode": "ON|OFF|NEUTRAL", "riskDrivers": "<one concise sentence>"}}
 
 {DELIM}
 SECTION: FUNDAMENTAL_CONFIDENCE
 {DELIM}
-Score the FUNDAMENTAL CONFIDENCE for each currency (0.0-10.0) based on: directional clarity from the news, central bank stance clarity, rate differential strength, news-driven momentum. This score provides a quick conviction level, indicates whether fundamentals are aligned or mixed, and gives context for how aggressively to trade.
+For EACH of these currencies output one JSON object: {currencies}.
 
-Scoring ranges:
-- 8-10 = STRONG alignment (strong macro conviction; fundamentals clearly support one direction — trade aggressively in the bias direction)
-- 6-7 = MODERATE tradable (fundamentals lean one way but some mixed signals present — trade with normal sizing)
-- 5 or below = MIXED conditions (fundamentals unclear or conflicting — avoid or size down significantly)
+IMPORTANT — `strength` is RELATIVE CURRENCY STRENGTH. Rank all eight currencies AGAINST EACH OTHER (do not assess any currency in isolation), strongest to weakest, then map each to a label from that single ranking. This is the forex "currency strength meter" concept: the goal is to identify which currencies are strong and which are weak relative to the rest of the board, so the strongest can be bought against the weakest.
 
-Respond in this exact format, one currency per line, nothing else:
-USD: score=X.X alignment=STRONG interpretation=<one concise sentence>
-EUR: score=X.X alignment=MODERATE interpretation=<one concise sentence>
-GBP: score=X.X alignment=MIXED interpretation=<one concise sentence>
-JPY: score=X.X alignment=<STRONG|MODERATE|MIXED> interpretation=<one concise sentence>
-AUD: score=X.X alignment=<STRONG|MODERATE|MIXED> interpretation=<one concise sentence>
-NZD: score=X.X alignment=<STRONG|MODERATE|MIXED> interpretation=<one concise sentence>
-CAD: score=X.X alignment=<STRONG|MODERATE|MIXED> interpretation=<one concise sentence>
-CHF: score=X.X alignment=<STRONG|MODERATE|MIXED> interpretation=<one concise sentence>
+Base the relative ranking on:
+- interest-rate differentials between the central banks (higher / rising rates = relatively stronger),
+- relative hawkish vs dovish positioning (who is tightening vs easing compared to the others),
+- relative growth, inflation and data momentum,
+- risk sentiment and safe-haven flows (risk-off tends to favour USD, JPY, CHF; risk-on tends to favour AUD, NZD, CAD).
+
+Fields:
+- score (0.0-10.0): your CONFIDENCE in this read — how clear and well-supported the signal is — NOT the strength itself.
+- alignment: STRONG (score 8-10), MODERATE (6-7), MIXED (5 or below). Must match the score band.
+- strength: the relative-ranking label, one of very-strong, strong, neutral, weak, very-weak. SPREAD the labels across the scale to reflect the ordering — broadly the top of the ranking is very-strong and the bottom is very-weak. Do NOT give most currencies the same label; the array as a whole must show a clear strongest-to-weakest ordering. Genuinely similar currencies may share a label, but there must be a distinguishable top and bottom.
+- rank: this currency's exact position in the relative ranking — a UNIQUE integer from 1 (strongest) to 8 (weakest). Every currency must receive a DIFFERENT rank; no ties and no gaps. The rank must agree with strength (rank 1-2 ≈ very-strong/strong, rank 7-8 ≈ weak/very-weak).
+- stance: hawkish, dovish, or neutral (central bank policy direction).
+- driver: the present-tense reason it is moving right now (one short sentence).
+- outlook: where it is heading next (one short sentence, forward-looking).
+
+Keep HTF_ALIGNMENT and BIAS_SUMMARY consistent with this ranking: a pair built from a relatively strong base and a relatively weak quote should carry a directional bias in the corresponding direction (e.g. very-strong base vs very-weak quote = strong bias).
+
+Output a JSON array. Example showing the VARIETY expected (use REAL values from the news, not these):
+[{{"currency":"USD","score":8.4,"alignment":"STRONG","strength":"very-strong","rank":1,"stance":"hawkish","driver":"Hot CPI print reinforcing higher-for-longer rates","outlook":"Bias stays firm into next Fed meeting"}},
+ {{"currency":"JPY","score":4.2,"alignment":"MIXED","strength":"weak","rank":8,"stance":"dovish","driver":"BoJ reaffirming accommodative policy","outlook":"Vulnerable unless intervention risk rises"}}]
 
 {DELIM}
 SECTION: HTF_ALIGNMENT
 {DELIM}
-For each instrument determine daily (HTF fundamental direction from the news) and intraday (current session momentum from the news) bias, and whether they are CONFIRMED (same non-neutral direction), CONFLICTED (opposing), or NEUTRAL.
-Respond in this exact format, one instrument per line, nothing else:
-GBPJPY: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-EURJPY: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-USDJPY: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-GBPUSD: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-EURUSD: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-AUDUSD: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-NZDUSD: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-USDCAD: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-USDCHF: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-EURGBP: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-EURAUD: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-EURNZD: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-EURCAD: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-EURCHF: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-GBPAUD: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-GBPNZD: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-GBPCAD: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-GBPCHF: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-AUDJPY: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-AUDNZD: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-AUDCAD: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-AUDCHF: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-NZDJPY: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-NZDCAD: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-NZDCHF: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-CADJPY: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-CADCHF: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-CHFJPY: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-XAUUSD: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-XAGUSD: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-USOIL: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-UKOIL: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-BTCUSD: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-ETHUSD: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-ETHBTC: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-NAS100: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-SPX500: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-US30: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-GER40: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-UK100: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
-JP225: daily=BULLISH intraday=BULLISH alignment=CONFIRMED
+For EACH instrument output one JSON object with daily (HTF fundamental direction) and intraday (current session momentum) bias, and the alignment between them: CONFIRMED (same non-neutral direction), CONFLICTED (opposing), NEUTRAL (either side neutral).
+daily / intraday values: bullish, bearish, or neutral.
+Instruments (output ALL of them): {instruments}
+
+Output a JSON array. Example showing the VARIETY expected (do NOT copy — derive from the news):
+[{{"symbol":"USDJPY","daily":"bullish","intraday":"bullish","alignment":"CONFIRMED"}},
+ {{"symbol":"EURUSD","daily":"bearish","intraday":"bullish","alignment":"CONFLICTED"}},
+ {{"symbol":"AUDNZD","daily":"neutral","intraday":"bearish","alignment":"NEUTRAL"}}]
 
 {DELIM}
 SECTION: BIAS_SUMMARY
 {DELIM}
-For every instrument listed below state: direction (bullish/bearish/neutral), strength (weak/moderate/strong), what is driving it, what must happen to invalidate it.
-Include: GBPJPY, EURJPY, USDJPY, GBPUSD, EURUSD, AUDUSD, NZDUSD, USDCAD, USDCHF, EURGBP, EURAUD, EURNZD, EURCAD, EURCHF, GBPAUD, GBPNZD, GBPCAD, GBPCHF, AUDJPY, AUDNZD, AUDCAD, AUDCHF, NZDJPY, NZDCAD, NZDCHF, CADJPY, CADCHF, CHFJPY, BTCUSD, ETHUSD, ETHBTC, XAUUSD, XAGUSD, USOIL, UKOIL, NAS100, SPX500, US30, GER40, UK100, JP225.
-Label each instrument clearly.
+For EACH instrument output one JSON object: direction (bullish/bearish/neutral), strength (strong/moderate/weak), drivers (what is driving it), invalidation (what must happen to flip it).
+Instruments (output ALL of them): {instruments}
+
+Output a JSON array. Example showing the VARIETY expected (derive real values from the news):
+[{{"symbol":"GBPUSD","direction":"bearish","strength":"strong","drivers":"UK retail sales miss plus firm dollar","invalidation":"Break and hold above last week's high"}},
+ {{"symbol":"XAUUSD","direction":"bullish","strength":"moderate","drivers":"Safe-haven demand on geopolitical risk","invalidation":"Risk-on rotation and rising real yields"}}]
 
 {DELIM}
 SECTION: NEWS_IMPACT
 {DELIM}
-For each news item from the last 10 minutes: impact level (HIGH/MEDIUM/LOW), currency or asset affected, policy implication, short-term and medium-term effect, whether it strengthens or weakens the current bias.
+For each notable news item: impact level (HIGH/MEDIUM/LOW), currency or asset affected, policy implication, short-term and medium-term effect, and whether it strengthens or weakens the current bias. Write this as readable prose.
+
+{DELIM}
+SECTION: ECONOMIC_EVENTS
+{DELIM}
+Extract the scheduled or just-released economic events mentioned in the scraped news (rate decisions, CPI/inflation, jobs/NFP, GDP, PMI, central-bank speakers, etc.). Only include events actually referenced in the news — do NOT invent a standard calendar.
+Fields per event:
+- currency: the 3-letter currency most affected (e.g. USD, EUR, GBP, JPY).
+- name: short event name (e.g. "US CPI", "FOMC Decision", "ECB Press Conference").
+- timing: a short human-readable label exactly as implied by the news (e.g. "In ~90 min", "Today 13:30 GMT", "Tomorrow", "This week"). Use "" if unclear.
+- impact: HIGH, MEDIUM or LOW.
+- hoursUntil: your best estimate of hours until release as a number, or null if unknown or already released.
+
+Output a JSON array (empty array [] if the news mentions no datable events). Example showing the VARIETY expected (derive real values from the news):
+[{{"currency":"USD","name":"US CPI","timing":"Today 13:30 GMT","impact":"HIGH","hoursUntil":1.5}},
+ {{"currency":"GBP","name":"BoE Decision","timing":"Tomorrow","impact":"HIGH","hoursUntil":21}},
+ {{"currency":"EUR","name":"ECB Speakers","timing":"This week","impact":"MEDIUM","hoursUntil":null}}]
 
 {DELIM}
 SECTION: MACRO_NARRATIVE
@@ -164,16 +181,7 @@ PART 5 — INDICES
 For NAS100, SPX500, US30, GER40, UK100, JP225: key drivers, directional pressure.
 """
 
-SECTION_KEYS = [
-    "SESSION_FLOW",
-    "TRADE_ENVIRONMENT",
-    "FUNDAMENTAL_CONFIDENCE",
-    "HTF_ALIGNMENT",
-    "BIAS_SUMMARY",
-    "NEWS_IMPACT",
-    "MACRO_NARRATIVE",
-]
-
+# Mapping from the section name in the prompt to the SSE key the frontend reads.
 KEY_MAP = {
     "SESSION_FLOW":           "session_flow",
     "TRADE_ENVIRONMENT":      "trade_environment",
@@ -181,8 +189,10 @@ KEY_MAP = {
     "HTF_ALIGNMENT":          "htf_alignment",
     "BIAS_SUMMARY":           "bias_summary",
     "NEWS_IMPACT":            "news_impact",
+    "ECONOMIC_EVENTS":        "economic_events",
     "MACRO_NARRATIVE":        "macro_narrative",
 }
+SECTION_KEYS = list(KEY_MAP.keys())
 
 _SECTION_RE = re.compile(
     r"═+\s*\nSECTION:\s*(" + "|".join(SECTION_KEYS) + r")\s*\n═+",
@@ -190,11 +200,124 @@ _SECTION_RE = re.compile(
 )
 
 
-def _scrape_hash(scraped: dict[str, str]) -> str:
-    combined = "".join(scraped.get(k) or "" for k in sorted(scraped))
-    return hashlib.sha256(combined.encode()).hexdigest()
+# ─────────────────────────────────────────────────────────────────────────────
+# JSON extraction + per-section validation
+# ─────────────────────────────────────────────────────────────────────────────
+def _strip_fences(text: str) -> str:
+    t = text.strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
+        t = re.sub(r"\s*```$", "", t)
+    return t.strip()
 
 
+def _extract_json(text: str) -> Optional[Any]:
+    """Tolerantly pull the first complete JSON value out of a section body."""
+    t = _strip_fences(text)
+    try:
+        return json.loads(t)
+    except Exception:
+        pass
+
+    start = next((i for i, ch in enumerate(t) if ch in "[{"), None)
+    if start is None:
+        return None
+
+    opener = t[start]
+    closer = "]" if opener == "[" else "}"
+    depth = 0
+    in_str = False
+    esc = False
+    for j in range(start, len(t)):
+        c = t[j]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c == opener:
+            depth += 1
+        elif c == closer:
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(t[start : j + 1])
+                except Exception:
+                    return None
+    return None
+
+
+def _validate_session_flow(text: str) -> Optional[dict]:
+    data = _extract_json(text)
+    if not isinstance(data, dict):
+        return None
+    try:
+        return SessionFlow(**data).model_dump()
+    except Exception as e:
+        print(f"[Parser] session_flow invalid: {e}")
+        return None
+
+
+def _validate_market_context(text: str) -> Optional[dict]:
+    data = _extract_json(text)
+    if not isinstance(data, dict):
+        return None
+    try:
+        return MarketContext(**data).model_dump()
+    except Exception as e:
+        print(f"[Parser] trade_environment invalid: {e}")
+        return None
+
+
+def _validate_list(text: str, model, label: str) -> Optional[list]:
+    data = _extract_json(text)
+    if not isinstance(data, list):
+        return None
+    out = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        try:
+            out.append(model(**item).model_dump())
+        except Exception as e:
+            print(f"[Parser] {label} item dropped: {e}")
+    return out or None
+
+
+_STRUCTURED_VALIDATORS: dict[str, Callable[[str], Optional[Any]]] = {
+    "session_flow":           _validate_session_flow,
+    "trade_environment":      _validate_market_context,
+    "fundamental_confidence": lambda t: _validate_list(t, CurrencyScore, "fundamental_confidence"),
+    "htf_alignment":          lambda t: _validate_list(t, HtfAlignmentItem, "htf_alignment"),
+    "bias_summary":           lambda t: _validate_list(t, InstrumentBias, "bias_summary"),
+    "economic_events":        lambda t: _validate_list(t, EconomicEvent, "economic_events"),
+}
+
+
+def _finalize_section(mapped_key: str, raw_text: str) -> Any:
+    """Structured key -> validated JSON (or None on failure). Prose -> stripped text."""
+    validator = _STRUCTURED_VALIDATORS.get(mapped_key)
+    if validator:
+        return validator(raw_text)
+    return raw_text.strip()
+
+
+def _empty_collected() -> dict[str, Any]:
+    # Prose keys default to "", structured keys default to None.
+    return {
+        v: ("" if v in ("news_impact", "macro_narrative") else None)
+        for v in KEY_MAP.values()
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Context helpers
+# ─────────────────────────────────────────────────────────────────────────────
 def _build_context(scraped: dict[str, str]) -> dict:
     today = datetime.now(timezone.utc).strftime("%A, %d %B %Y")
     return {
@@ -204,17 +327,20 @@ def _build_context(scraped: dict[str, str]) -> dict:
         "deltaone":          scraped.get("DeltaOne_X")        or "No data available.",
         "livesquawk":        scraped.get("LiveSquawk")        or "No data available.",
         "DELIM":             SECTION_DELIMITER,
+        "currencies":        ", ".join(CURRENCIES),
+        "instruments":       ", ".join(INSTRUMENTS),
     }
 
 
-def _parse_sections(raw: str) -> dict[str, str]:
+def _parse_sections(raw: str) -> dict[str, Any]:
+    """Blocking-path parser: split the full response, validate each section."""
     splits = _SECTION_RE.split(raw)
-    result = {v: "" for v in KEY_MAP.values()}
+    result = _empty_collected()
     i = 1
     while i + 1 < len(splits):
-        key = KEY_MAP.get(splits[i].strip().upper())
-        if key:
-            result[key] = splits[i + 1].strip()
+        mapped_key = KEY_MAP.get(splits[i].strip().upper())
+        if mapped_key:
+            result[mapped_key] = _finalize_section(mapped_key, splits[i + 1])
         i += 2
     return result
 
@@ -224,34 +350,19 @@ def _extract_retry_delay(error_str: str) -> float:
     return min(float(m.group(1)) + 2, 90) if m else BASE_DELAY
 
 
-def _is_cache_valid(entry: dict) -> bool:
-    return (time.time() - entry["timestamp"]) < CACHE_TTL_SECONDS
-
-
-async def stream_analysis(scraped: dict[str, str]) -> AsyncGenerator[dict[str, str], None]:
-    scrape_id = _scrape_hash(scraped)
-
-    if scrape_id in _cache and _is_cache_valid(_cache[scrape_id]):
-        age = int(time.time() - _cache[scrape_id]["timestamp"])
-        print(f"[Cache] HIT (age {age}s) — streaming cached sections instantly")
-        for raw_key, mapped_key in KEY_MAP.items():
-            content = _cache[scrape_id]["data"].get(mapped_key, "")
-            if content:
-                yield {mapped_key: content}
-                await asyncio.sleep(0)
-        yield {"_meta": "cache_hit"}
-        return
-
-    print("[Cache] MISS — starting Gemini streaming...")
+# ─────────────────────────────────────────────────────────────────────────────
+# Streaming
+# ─────────────────────────────────────────────────────────────────────────────
+async def stream_analysis(scraped: dict[str, str]) -> AsyncGenerator[dict[str, Any], None]:
+    print("[Gemini] Starting streaming analysis...")
     ctx    = _build_context(scraped)
     prompt = MEGA_PROMPT.format(**ctx)
 
     last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
-        buffer          = ""
-        collected       = {v: "" for v in KEY_MAP.values()}
-        current_key     = None
-        current_content = []
+        buffer      = ""
+        collected   = _empty_collected()
+        current_key = None
 
         try:
             print(f"[Gemini] Stream attempt {attempt}/{MAX_RETRIES}...")
@@ -268,31 +379,31 @@ async def stream_analysis(scraped: dict[str, str]) -> AsyncGenerator[dict[str, s
                     if not m:
                         break
 
-                    before      = buffer[:m.start()]
+                    before       = buffer[: m.start()]
                     section_name = m.group(1).strip().upper()
-                    buffer      = buffer[m.end():]
+                    buffer       = buffer[m.end():]
 
                     if current_key and before.strip():
-                        content = before.strip()
-                        collected[current_key] = content
-                        yield {current_key: content}
-                        await asyncio.sleep(0)
+                        content = _finalize_section(current_key, before)
+                        if content:
+                            collected[current_key] = content
+                            yield {current_key: content}
+                            await asyncio.sleep(0)
 
-                    current_key     = KEY_MAP.get(section_name)
-                    current_content = []
+                    current_key = KEY_MAP.get(section_name)
 
+            # Flush the final section (no trailing delimiter follows it)
             if current_key and buffer.strip():
-                content = buffer.strip()
-                collected[current_key] = content
-                yield {current_key: content}
-                await asyncio.sleep(0)
+                content = _finalize_section(current_key, buffer)
+                if content:
+                    collected[current_key] = content
+                    yield {current_key: content}
+                    await asyncio.sleep(0)
 
             missing = [k for k, v in collected.items() if not v]
             if missing:
                 print(f"[Parser] Warning — sections with no content: {missing}")
 
-            _cache[scrape_id] = {"timestamp": time.time(), "data": collected}
-            print(f"[Cache] Stored under hash {scrape_id[:12]}...")
             yield {"_meta": "done"}
             return
 
@@ -320,15 +431,11 @@ async def stream_analysis(scraped: dict[str, str]) -> AsyncGenerator[dict[str, s
     raise RuntimeError(f"Gemini failed after {MAX_RETRIES} retries. Last error: {last_error}")
 
 
-def run_full_analysis(scraped: dict[str, str]) -> dict[str, str]:
-    scrape_id = _scrape_hash(scraped)
-
-    if scrape_id in _cache and _is_cache_valid(_cache[scrape_id]):
-        age = int(time.time() - _cache[scrape_id]["timestamp"])
-        print(f"[Cache] HIT — returning cached result (age {age}s)")
-        return _cache[scrape_id]["data"]
-
-    print("[Cache] MISS — calling Gemini (blocking single call)...")
+# ─────────────────────────────────────────────────────────────────────────────
+# Blocking (kept for compatibility)
+# ─────────────────────────────────────────────────────────────────────────────
+def run_full_analysis(scraped: dict[str, str]) -> dict[str, Any]:
+    print("[Gemini] Calling Gemini (blocking single call)...")
     ctx    = _build_context(scraped)
     prompt = MEGA_PROMPT.format(**ctx)
 
@@ -342,7 +449,6 @@ def run_full_analysis(scraped: dict[str, str]) -> dict[str, str]:
             if missing:
                 print(f"[Parser] Warning: {missing}")
 
-            _cache[scrape_id] = {"timestamp": time.time(), "data": parsed}
             return parsed
 
         except Exception as e:
@@ -350,27 +456,10 @@ def run_full_analysis(scraped: dict[str, str]) -> dict[str, str]:
             err_str    = str(e)
 
             if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                wait = _extract_retry_delay(err_str)
-                time.sleep(wait)
+                time.sleep(_extract_retry_delay(err_str))
             elif "503" in err_str or "UNAVAILABLE" in err_str or "overloaded" in err_str.lower():
                 time.sleep(BASE_DELAY * attempt)
             else:
                 raise
 
     raise RuntimeError(f"Gemini failed after {MAX_RETRIES} retries. Last error: {last_error}")
-
-
-def get_cache_status() -> dict:
-    now   = time.time()
-    valid = [k for k, v in _cache.items() if _is_cache_valid(v)]
-    return {
-        "entries":       len(_cache),
-        "valid_entries": len(valid),
-        "ttl_seconds":   CACHE_TTL_SECONDS,
-        "ages_seconds":  {k[:12]: int(now - v["timestamp"]) for k, v in _cache.items()},
-    }
-
-
-def invalidate_cache() -> None:
-    _cache.clear()
-    print("[Cache] Manually cleared.")
