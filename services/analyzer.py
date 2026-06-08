@@ -58,14 +58,15 @@ RULES:
 --- TradingEconomics ---
 {trading_economics}
 
---- FXStreet ---
-{fxstreet}
-
---- DeltaOne (X) ---
-{deltaone}
+--- InvestingLive ---
+{investinglive}
 
 --- LiveSquawk ---
 {livesquawk}
+
+--- Objective Currency Strength Meter (ECB price-derived) ---
+{currency_strength}
+This is an objective, price-derived relative-strength ranking computed from ECB daily fixings — not news commentary. Treat it as a quantitative cross-check: weigh it alongside the qualitative news above when ranking currencies in FUNDAMENTAL_CONFIDENCE. Where the news and this meter disagree, prefer the news for forward-looking/policy reasoning but note the meter reflects realised price movement over the window.
 
 ---
 
@@ -322,10 +323,10 @@ def _build_context(scraped: dict[str, str]) -> dict:
     today = datetime.now(timezone.utc).strftime("%A, %d %B %Y")
     return {
         "today":             today,
-        "trading_economics": scraped.get("TradingEconomics") or "No data available.",
-        "fxstreet":          scraped.get("FXStreet")         or "No data available.",
-        "deltaone":          scraped.get("DeltaOne_X")        or "No data available.",
+        "trading_economics": scraped.get("TradingEconomics")  or "No data available.",
+        "investinglive":     scraped.get("InvestingLive")     or "No data available.",
         "livesquawk":        scraped.get("LiveSquawk")        or "No data available.",
+        "currency_strength": scraped.get("CurrencyStrength")  or "No data available.",
         "DELIM":             SECTION_DELIMITER,
         "currencies":        ", ".join(CURRENCIES),
         "instruments":       ", ".join(INSTRUMENTS),

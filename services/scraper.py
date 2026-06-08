@@ -3,6 +3,7 @@ import json
 import asyncio
 from typing import Optional
 from config import SERPER_API_KEY
+from services.currency_strength import get_strength_report
 
 # ── Timeout tuning ────────────────────────────────────────────────────────────
 #
@@ -23,9 +24,9 @@ REQUEST_TIMEOUT_SECONDS = 25
 # asyncio layer steps in. This is purely a safety net for edge cases where the
 # socket timeout somehow doesn't fire (e.g. a very large partial read).
 #
-# Because all four scrapers run concurrently via asyncio.gather, the total
+# Because all three scrapers run concurrently via asyncio.gather, the total
 # wall-clock time for scrape_all_sources() == time of the SLOWEST single
-# source, not the sum of all four. So even 25 s per source = max ~25 s total.
+# source, not the sum of all three. So even 25 s per source = max ~25 s total.
 #
 SCRAPER_TIMEOUT_SECONDS = 30
 
@@ -104,20 +105,23 @@ async def scrape_all_sources() -> dict[str, str]:
     """
     Scrapes all configured financial news sources concurrently.
 
-    All four sources run in parallel via asyncio.gather, so:
+    All three sources run in parallel via asyncio.gather, so:
       - A slow-but-working source DOES return its data (up to 25 s).
       - A truly dead/unreachable source gets cut off at 25 s.
-      - Total wall-clock time = slowest single source, NOT sum of all four.
+      - Total wall-clock time = slowest single source, NOT sum of all three.
     """
     sources = {
         "TradingEconomics": "https://tradingeconomics.com/",
-        "FXStreet":         "https://www.fxstreet.com/news",
-        "DeltaOne_X":       "https://x.com/DeItaone",
+        "InvestingLive":    "https://investinglive.com/live-feed/",
         "LiveSquawk":       "https://www.livesquawk.com/latest-news",
     }
 
-    results = await asyncio.gather(
+    # The objective currency-strength meter runs in parallel with the scrapers,
+    # so it adds no extra wall-clock time. It's enrichment, not a hard source:
+    # if it fails it simply isn't included.
+    *results, strength_report = await asyncio.gather(
         *[scrape_url(url) for url in sources.values()],
+        get_strength_report(lookback_days=1),
         return_exceptions=True,
     )
 
@@ -130,6 +134,13 @@ async def scrape_all_sources() -> dict[str, str]:
             scraped[name] = result
             print(f"[Scraper] ✓ {name} ({len(result):,} chars)")
 
+    if isinstance(strength_report, Exception) or not strength_report:
+        print("[Scraper] ✗ CurrencyStrength — no data returned")
+        scraped["CurrencyStrength"] = ""
+    else:
+        scraped["CurrencyStrength"] = strength_report
+        print(f"[Scraper] ✓ CurrencyStrength ({len(strength_report):,} chars)")
+
     loaded = sum(1 for v in scraped.values() if v)
-    print(f"[Scraper] Done — {loaded}/{len(sources)} sources returned data")
+    print(f"[Scraper] Done — {loaded}/{len(scraped)} sources returned data")
     return scraped
